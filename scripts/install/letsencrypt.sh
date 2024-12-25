@@ -9,7 +9,6 @@
 #   including (via compiler) GPL-licensed code must also be made available
 #   under the GPL along with build & install instructions.
 #
-
 if [[ ! -f /install/.nginx.lock ]]; then
     echo_error "This script is meant to be used in conjunction with nginx and it has not been installed. Please install nginx first and restart this installer."
     exit 1
@@ -39,8 +38,11 @@ if [[ $main == yes ]]; then
     sed -i "s/server_name .*;/server_name $hostname;/g" /etc/nginx/sites-enabled/default
 fi
 
-if [[ -n $LE_CF_API ]] || [[ -n $LE_CF_ZONE ]]; then
+# Check if Cloudflare token and zone ID are provided
+if [[ -n $LE_CF_API_TOKEN ]] && [[ -n $LE_CF_ZONE ]]; then
     LE_BOOL_CF=yes
+else
+    LE_BOOL_CF=no
 fi
 
 if [[ -z $LE_BOOL_CF ]]; then
@@ -55,7 +57,6 @@ else
 fi
 
 if [[ ${cf} == yes ]]; then
-
     if [[ $hostname =~ (\.cf$|\.ga$|\.gq$|\.ml$|\.tk$) ]]; then
         echo_error "Cloudflare does not support API calls for the following TLDs: cf, .ga, .gq, .ml, or .tk"
         exit 1
@@ -76,34 +77,51 @@ if [[ ${cf} == yes ]]; then
         [[ $LE_CF_ZONEEXISTS = "no" ]] && zone=no
     fi
 
-    if [[ -z $LE_CF_API ]]; then
-        echo_query "Enter CF API key"
-        read -e api
-    else
-        api=$LE_CF_API
+    if [[ -z $LE_CF_API_TOKEN ]]; then
+        echo_error "Cloudflare API token not found. Please set LE_CF_API_TOKEN."
+        exit 1
     fi
 
-    export CF_Key="${api}"
+    export CF_Token="${LE_CF_API_TOKEN}"
+    export CF_Zone="${LE_CF_ZONE}"
 
+    # Validate API Token
+    valid=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user" \
+        -H "Authorization: Bearer $CF_Token" \
+        -H "Content-Type: application/json")
 
-    valid=$(curl -X GET "https://api.cloudflare.com/client/v4/user" -H "X-Auth-Key: $api" -H "Content-Type: application/json")
     if [[ $valid == *"\"success\":false"* ]]; then
         message="API CALL FAILED. DUMPING RESULTS:\n$valid"
         echo_error "$message"
         exit 1
     fi
 
+    # Add DNS record if necessary
     if [[ ${record} == no ]]; then
-
-        if [[ -z $LE_CF_ZONE ]]; then
-            echo_query "Zone Name (example.com)"
-            read -e zone
-        else
-            zone=$LE_CF_ZONE
+        if [[ -z $CF_Zone ]]; then
+            echo_query "Enter Cloudflare Zone ID"
+            read -e CF_Zone
         fi
 
-        zoneid=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$zone" -H "X-Auth-Key: $api" -H "Content-Type: application/json" | grep -Po '(?<="id":")[^"]*' | head -1)
-        addrecord=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records" -H "X-Auth-Key: $api" -H "Content-Type: application/json" --data "{\"id\":\"$zoneid\",\"type\":\"A\",\"name\":\"$hostname\",\"content\":\"$ip\",\"proxied\":true}")
+        # Get Zone ID if not provided
+        if [[ -z $CF_Zone ]]; then
+            zoneid=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$hostname" \
+                -H "Authorization: Bearer $CF_Token" \
+                -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+            if [[ -z $zoneid ]]; then
+                echo_error "Could not find Zone ID for $hostname."
+                exit 1
+            fi
+        else
+            zoneid=$CF_Zone
+        fi
+
+        addrecord=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records" \
+            -H "Authorization: Bearer $CF_Token" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"A\",\"name\":\"$hostname\",\"content\":\"$ip\",\"proxied\":true}")
+
         if [[ $addrecord == *"\"success\":false"* ]]; then
             message="API UPDATE FAILED. DUMPING RESULTS:\n$addrecord"
             echo_error "$message"
@@ -125,7 +143,6 @@ fi
 
 mkdir -p /etc/nginx/ssl/${hostname}
 chmod 700 /etc/nginx/ssl
-
 /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt >> $log 2>&1 || {
     echo_warn "Could not set default certificate authority to Let's Encrypt. Upgrading acme.sh to retry."
     /root/.acme.sh/acme.sh --upgrade >> $log 2>&1 || {
@@ -165,10 +182,12 @@ echo_progress_done "Certificate acquired"
 
 echo_progress_start "Installing certificate"
 /root/.acme.sh/acme.sh --force --install-cert -d ${hostname} --key-file /etc/nginx/ssl/${hostname}/key.pem --fullchain-file /etc/nginx/ssl/${hostname}/fullchain.pem --ca-file /etc/nginx/ssl/${hostname}/chain.pem --reloadcmd "systemctl reload nginx"
+
 if [[ $main == yes ]]; then
     sed -i "s/ssl_certificate .*/ssl_certificate \/etc\/nginx\/ssl\/${hostname}\/fullchain.pem;/g" /etc/nginx/sites-enabled/default
     sed -i "s/ssl_certificate_key .*/ssl_certificate_key \/etc\/nginx\/ssl\/${hostname}\/key.pem;/g" /etc/nginx/sites-enabled/default
 fi
+
 echo_progress_done "Certificate installed"
 
 # Add LE certs to ZNC, if installed.
@@ -183,5 +202,4 @@ if [[ -f /install/.vsftpd.lock ]]; then
 fi
 
 systemctl reload nginx
-
 echo_success "Letsencrypt installed"
